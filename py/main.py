@@ -5,83 +5,14 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, Button, RichLog
 from textual.containers import Container
 from textual.reactive import reactive
-
-# --- Configuration ---
-ADB_PATH = "adb"  # Assumes 'adb' is in your PATH. Specify full path if not, e.g., "/usr/bin/adb"
-# This variable needs to be handled carefully because it's modified by check_adb_connection
-# If set here, it will be the preferred serial. If empty, check_adb_connection will try to auto-detect.
-# It MUST be declared outside the class, and modified using 'nonlocal' in methods.
-DEVICE_SERIAL = ""
-# --- End Configuration ---
+import css
+import config
+import colors
 
 class AdbTetherApp(App):
     """A Textual app for ADB USB Tethering."""
 
-    CSS = """
-    #status-container {
-        border: thick $primary;
-        padding: 1 2;
-        margin: 1 2;
-        height: 8;
-    }
-    #status-title {
-        text-align: center;
-        text-style: bold;
-        color: $accent;
-    }
-    #message-log {
-        border: thick $secondary;
-        padding: 0 1;
-        margin: 1 2;
-        height: 6;
-        overflow-y: scroll;
-    }
-    #message-log-title {
-        text-align: center;
-        text-style: bold;
-        color: $accent-lighten-1;
-    }
-    #buttons {
-        layout: horizontal;
-        align: center middle;
-        height: 5;
-        margin: 1 2;
-        /* gap: 2;  <-- This line is commented out for wider compatibility */
-    }
-    Button {
-        min-width: 18;
-        background: $panel;
-        color: $text;
-        border: solid $primary;
-    }
-    Button:hover {
-        background: $primary-darken-1;
-    }
-    Button.-active {
-        background: $success;
-        color: black;
-    }
-    .status-line {
-        color: $text;
-    }
-    .status-ok {
-        color: green;
-        text-style: bold;
-    }
-    .status-warn {
-        color: yellow;
-        text-style: bold;
-    }
-    .status-error {
-        color: red;
-        text-style: bold;
-    }
-    """
-
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("r", "refresh_status", "Refresh Status"),
-    ]
+   
 
     # Reactive variables to update UI elements
     adb_status = reactive("Unknown", layout=False)
