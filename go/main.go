@@ -1,479 +1,539 @@
+// main.go
+//
+// This application provides a professional Terminal User Interface (TUI) to manage
+// USB tethering for an Android device from a Linux machine. It uses adb
+// to communicate with the device and provides real-time status updates in a
+// clean, multi-pane layout.
+//
+// Dependencies:
+// - Go (https://golang.org/)
+// - adb (Android Debug Bridge) must be installed and in the system's PATH.
+// - Bubble Tea & Lipgloss libraries (will be fetched by `go mod tidy`)
+//
+// To run this application:
+// 1. Save the code as `main.go`.
+// 2. Open a terminal in the same directory.
+// 3. Run `go mod init go-tether-pro` (only the first time).
+// 4. Run `go mod tidy` to download dependencies.
+// 5. Run `go run main.go`.
+
 package main
 
 import (
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
-
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"time"
+	
+    "github.com/charmbracelet/bubbles/spinner"
+    github.com/fatih/color "github.com/fatih/color"
+    "github.com/charmbracelet/bubbles/viewport"
+    tea "github.com/charmbracelet/bubbletea"
+    "github.com/charmbracelet/lipgloss"
+    "github.com/mbndr/figlet4go"
 )
 
-// --- Configuration ---
+// --- STYLES ---
+
 const (
-	adbPath      = "adb" // Assumes 'adb' is in your PATH. Specify full path if not, e.g., "/usr/bin/adb"
-	deviceSerial = ""    // Leave empty to auto-select. Set to your phone's serial if multiple devices.
+	colorPurple    = lipgloss.Color("57")
+	colorGray      = lipgloss.Color("240")
+	colorGreen     = lipgloss.Color("78")
+	colorRed       = lipgloss.Color("197")
+	colorYellow    = lipgloss.Color("228")
+	colorBlue      = lipgloss.Color("63")
+	colorDarkGray  = lipgloss.Color("235")
+	colorLightGray = lipgloss.Color("244")
 )
 
-// --- Styling with Lipgloss ---
 var (
-	headerStyle = lipgloss.NewStyle().
+	// General layout styling
+	appStyle = lipgloss.NewStyle().Margin(1, 2)
+
+	// Banner Style
+	bannerStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#9B59B6")). // Purple
-			Align(lipgloss.Center).
-			MarginBottom(1)
+			Foreground(lipgloss.Color("#FAFAFA")).
+			Background(colorPurple).
+			Padding(0, 1)
 
-	statusBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.ThickBorder()).
-			BorderForeground(lipgloss.Color("#3498DB")). // Blue
-			Padding(1, 2).
-			Margin(1, 2).
-			Height(7) // Adjusted to fit 3 lines of status + padding
+	// Box styles
+	boxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorBlue).
+			Padding(0, 1)
 
-	statusTitleStyle = lipgloss.NewStyle().
+	boxHeaderStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#6A5ACD")). // Slate Blue
-			Align(lipgloss.Center)
+			Foreground(colorPurple).
+			Padding(0, 1)
 
-	messageLogStyle = lipgloss.NewStyle().
-			Border(lipgloss.ThickBorder()).
-			BorderForeground(lipgloss.Color("#5DADE2")). // Light Blue
-			Padding(0, 1).
-			Margin(1, 2).
-			Height(5) // Adjusted to fit 2 lines of log + padding
-
-	messageLogTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#6A5ACD")). // Slate Blue
-			Align(lipgloss.Center)
-
+	// Menu styles
 	menuStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#8E44AD")). // Purple
-			Padding(1, 2).
-			Margin(1, 2).
-			Height(5) // Adjusted for menu items
+			BorderForeground(colorBlue).
+			Padding(1, 2)
+	menuCursorStyle = lipgloss.NewStyle().Foreground(colorPurple).Bold(true)
+	menuItemStyle   = lipgloss.NewStyle().Foreground(colorLightGray)
 
-	menuTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#8E44AD")). // Purple
-			Align(lipgloss.Center)
-
-	statusOKStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#2ECC71")).Bold(true) // Green
-	statusWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F1C40F")).Bold(true) // Yellow
-	statusErrStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#E74C3C")).Bold(true) // Red
-	statusInfoStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))          // White
-
-	logMsgStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))          // Dim white for log
-	logSuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#2ECC71")).Bold(true) // Green
-	logErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#E74C3C")).Bold(true) // Red
-	logInfoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#3498DB")).Bold(true) // Blue
-	logWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#F1C40F")).Bold(true) // Yellow
+	// Status styles
+	statusKeyStyle = lipgloss.NewStyle().Foreground(colorLightGray)
+	statusOKStyle  = lipgloss.NewStyle().Foreground(colorGreen)
+	statusErrStyle = lipgloss.NewStyle().Foreground(colorRed)
+	statusMidStyle = lipgloss.NewStyle().Foreground(colorYellow)
+	statusUnset    = lipgloss.NewStyle().Foreground(colorGray)
 )
 
-// --- Model Definition (The Elm Architecture) ---
+// --- LOGGING & STATE ---
+
+type logEntry struct {
+	timestamp time.Time
+	level     string
+	message   string
+}
+
+const (
+	logLevelInfo  = "INFO"
+	logLevelWarn  = "WARN"
+	logLevelError = "ERROR"
+	logLevelCmd   = "CMD"
+)
+
+// --- ADB COMMANDS ---
+
+const (
+	defaultUSBFunction = "mtp"
+	tetherUSBFunction  = "rndis"
+)
+
+// --- MODEL ---
 
 type model struct {
-	adbStatus        string
-	deviceInfo       string
-	linuxIfaceStatus string
-	adbReady         bool
-	currentSerial    string // Actual serial used for commands (from config or auto-detected)
-
-	log       []string
-	logScroll int // Not used in this simple log display, but good for future scrolling
-
-	choices []string
-	cursor  int // for menu selection
+	spinner     spinner.Model
+	logView     viewport.Model
+	width       int
+	height      int
+	ready       bool
+	isLoading   bool
+	lastLog     string
+	logs        []logEntry
+	status      appStatus
+	error       error
+	menuChoices []string
+	menuCursor  int
 }
 
-// Msg types for async operations (results returned by commands)
-type adbStatusMsg struct {
-	status string
-	info   string
-	ready  bool
-	serial string // The serial detected/used
-	logMsg string
+type appStatus struct {
+	adbPath               string
+	deviceConnected       bool
+	deviceName            string
+	isTethering           bool
+	currentUSBFunction    string
+	tetherDunRequired     string
+	tetherOffloadDisabled string
+	networkInterfaceName  string
+	networkIP             string
 }
 
-type linuxIfaceStatusMsg struct {
-	status string
-	logMsg string
-}
+// --- MESSAGES ---
 
-type adbCommandResultMsg struct {
-	description string
-	success     bool
-	output      string // Combined stdout/stderr
+type statusUpdateMsg struct {
+	status appStatus
+	err    error
 }
+type logMsg logEntry
+type tetheringDoneMsg struct{ err error }
 
-// --- Initial Model State ---
-func initialModel() model {
-	return model{
-		adbStatus:        statusInfoStyle.Render("Unknown"),
-		deviceInfo:       statusInfoStyle.Render("N/A"),
-		linuxIfaceStatus: statusInfoStyle.Render("Unknown"),
-		adbReady:         false,
-		currentSerial:    deviceSerial, // Initialize with config serial, or empty
-		log:              []string{},
-		logScroll:        0,
-		choices:          []string{"Enable Tethering", "Disable Tethering", "Refresh Status", "Exit"},
-		cursor:           0,
+// --- HELPER FUNCTIONS ---
+
+func runCmd(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("failed to run '%s %s': %w. Output: %s", name, strings.Join(args, " "), err, string(output))
 	}
+	return strings.TrimSpace(string(output)), nil
 }
 
-// --- Init (Initial command to run when the program starts) ---
-func (m model) Init() tea.Cmd {
-	return tea.Batch(checkAdbConnectionCmd(m.currentSerial), getLinuxInterfaceStatusCmd())
-}
+// --- CORE LOGIC ---
 
-// --- Update (Handle messages and update model state) ---
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit // Quit the application
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor-- // Move cursor up
-			}
-		case "down", "j":
-			if m.cursor < len(m.choices)-1 {
-				m.cursor++ // Move cursor down
-			}
-		case "enter":
-			switch m.cursor {
-			case 0: // Enable Tethering
-				if !m.adbReady {
-					m.addLog(logErrorStyle.Render("ADB not connected or authorized. Cannot enable tethering."))
-					return m, nil
-				}
-				m.addLog(logInfoStyle.Render("Attempting to ENABLE tethering..."))
-				return m, tea.Sequence(
-					// Pass m.currentSerial to the command functions
-					runAdbCommandCmd(m.currentSerial, "Attempting ADB root", "root"), // Often fails on stock ROMs, but harmless
-					runAdbCommandCmd(m.currentSerial, "Set tether_dun_required to 0", "shell settings put global tether_dun_required 0"),
-					runAdbCommandCmd(m.currentSerial, "Set USB functions to RNDIS", "shell svc usb setFunctions rndis"),
-					runAdbCommandCmd(m.currentSerial, "Disable tether_offload", "shell settings put global tether_offload_disabled 1"),
-					func() tea.Msg { return adbCommandResultMsg{description: "Tethering commands sent. Refreshing status.", success: true} }, // Synthetic success message
-					checkAdbConnectionCmd(m.currentSerial), // Re-check status
-					getLinuxInterfaceStatusCmd(),            // Re-check status
-				)
-			case 1: // Disable Tethering
-				if !m.adbReady {
-					m.addLog(logErrorStyle.Render("ADB not connected or authorized. Cannot disable tethering."))
-					return m, nil
-				}
-				m.addLog(logInfoStyle.Render("Attempting to DISABLE tethering..."))
-				return m, tea.Sequence(
-					// Pass m.currentSerial to the command functions
-					runAdbCommandCmd(m.currentSerial, "Restore tether_offload_disabled to 0", "shell settings put global tether_offload_disabled 0"),
-					runAdbCommandCmd(m.currentSerial, "Restore tether_dun_required to 1", "shell settings put global tether_dun_required 1"),
-					runAdbCommandCmd(m.currentSerial, "Restore default USB functions (MTP, ADB)", "shell svc usb setFunctions mtp,adb"),
-					func() tea.Msg { return adbCommandResultMsg{description: "Tethering deactivation commands sent. Refreshing status.", success: true} }, // Synthetic success message
-					checkAdbConnectionCmd(m.currentSerial), // Re-check status
-					getLinuxInterfaceStatusCmd(),            // Re-check status
-				)
-			case 2: // Refresh Status
-				m.addLog(logInfoStyle.Render("Refreshing status..."))
-				return m, tea.Batch(checkAdbConnectionCmd(m.currentSerial), getLinuxInterfaceStatusCmd())
-			case 3: // Exit
-				return m, tea.Quit
-			}
-
-		case "r": // Binding for Refresh Status
-			m.addLog(logInfoStyle.Render("Refreshing status..."))
-			return m, tea.Batch(checkAdbConnectionCmd(m.currentSerial), getLinuxInterfaceStatusCmd())
-		}
-
-	// Handle messages returning from async commands
-	case adbStatusMsg:
-		m.adbStatus = msg.status
-		m.deviceInfo = msg.info
-		m.adbReady = msg.ready
-		m.currentSerial = msg.serial // Update the model's currentSerial
-		if msg.logMsg != "" {
-			m.addLog(msg.logMsg)
-		}
-		return m, nil
-
-	case linuxIfaceStatusMsg:
-		m.linuxIfaceStatus = msg.status
-		if msg.logMsg != "" {
-			m.addLog(msg.logMsg)
-		}
-		return m, nil
-
-	case adbCommandResultMsg:
-		var logLine string
-		if msg.success {
-			logLine = logSuccessStyle.Render(fmt.Sprintf("SUCCESS: %s", msg.description))
-		} else {
-			logLine = logErrorStyle.Render(fmt.Sprintf("FAILED: %s", msg.description))
-			if msg.output != "" {
-				// Truncate long output lines for log readability
-				outputStr := strings.TrimSpace(msg.output)
-				if len(outputStr) > 80 { // Arbitrary length for log
-					outputStr = outputStr[:77] + "..."
-				}
-				logLine += logErrorStyle.Render(fmt.Sprintf(" (Output: %s)", outputStr))
-			}
-		}
-		m.addLog(logLine)
-		return m, nil
-	}
-
-	return m, cmd
-}
-
-// --- View (Render the UI based on the current model state) ---
-func (m model) View() string {
-	s := strings.Builder{}
-
-	// Header
-	headerText := fmt.Sprintf(
-		"┌───────────────────────────────────────────┐\n" +
-			"│       %sADB Tethering for Arch Linux%s        │\n" +
-			"│          %sSamsung Galaxy S23 Ultra%s           │\n" +
-			"└───────────────────────────────────────────┘",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#F1C40F")).Render, // Yellow for ADB Tethering
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6")).Render, // Purple for border
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#2ECC71")).Render, // Green for Samsung Galaxy
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6")).Render, // Purple for border
-	)
-	s.WriteString(headerStyle.Render(headerText) + "\n")
-
-	// Status Box
-	statusContent := fmt.Sprintf(
-		"ADB Connection:  %s\n"+
-			"Detected Device: %s\n"+
-			"Linux Interface: %s",
-		m.adbStatus, m.deviceInfo, m.linuxIfaceStatus,
-	)
-	s.WriteString(statusBoxStyle.Render(
-		statusTitleStyle.Render("SYSTEM STATUS") + "\n" +
-			statusContent,
-	) + "\n")
-
-	// Message Log
-	logContent := ""
-	// Display last 2 lines of log
-	start := 0
-	if len(m.log) > 2 {
-		start = len(m.log) - 2
-	}
-	for i := start; i < len(m.log); i++ {
-		logContent += m.log[i] + "\n"
-	}
-
-	s.WriteString(messageLogStyle.Render(
-		messageLogTitleStyle.Render("MESSAGES / OUTPUT") + "\n" +
-			logContent,
-	) + "\n")
-
-	// Menu
-	menuContent := ""
-	for i, choice := range m.choices {
-		cursor := "  " // default cursor
-		choiceStyled := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Render(choice) // Default white text
-		if m.cursor == i {
-			cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("#2ECC71")).Render("› ") // green arrow
-			choiceStyled = lipgloss.NewStyle().Foreground(lipgloss.Color("#2ECC71")).Bold(true).Render(choice) // Green bold when selected
-		}
-		menuContent += fmt.Sprintf("%s%s\n", cursor, choiceStyled)
-	}
-
-	s.WriteString(menuStyle.Render(
-		menuTitleStyle.Render("MENU") + "\n" +
-			menuContent,
-	) + "\n")
-
-	// Footer with keybindings
-	s.WriteString(lipgloss.NewStyle().Align(lipgloss.Center).Render(
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#95A5A6")).Render("Use ↑↓ to navigate, Enter to select, Q/Ctrl+C to quit, R to refresh"),
-	) + "\n")
-
-	return s.String()
-}
-
-// --- Helper for logging within the model ---
-func (m *model) addLog(line string) {
-	m.log = append(m.log, line)
-	// Keep log short to avoid overflowing the box (e.g., last 10 lines)
-	if len(m.log) > 10 {
-		m.log = m.log[len(m.log)-10:]
-	}
-}
-
-// --- Commands (Async operations executed by the Bubble Tea runtime) ---
-
-func checkAdbConnectionCmd(currentSerial string) tea.Cmd {
+func addLog(level, message string) tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command(adbPath, "devices")
-		output, err := cmd.Output()
+		return logMsg{timestamp: time.Now(), level: level, message: message}
+	}
+}
+
+func checkStatus() tea.Cmd {
+	return func() tea.Msg {
+		var status appStatus
+		var err error
+
+		status.adbPath, err = exec.LookPath("adb")
 		if err != nil {
-			return adbStatusMsg{
-				status: statusErrStyle.Render("ERROR: ADB not found"),
-				info:   statusInfoStyle.Render("N/A"),
-				ready:  false,
-				logMsg: logErrorStyle.Render(fmt.Sprintf("ADB command not found or error: %v", err)),
-			}
+			return statusUpdateMsg{err: fmt.Errorf("adb not found in PATH")}
 		}
 
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		var devices []string
-		for _, line := range lines {
-			if strings.Contains(line, "device") && !strings.Contains(line, "List of devices attached") {
-				parts := strings.Split(line, "\t")
-				if len(parts) > 0 {
-					devices = append(devices, parts[0])
-				}
-			}
+		out, err := runCmd(status.adbPath, "devices")
+		if err != nil {
+			return statusUpdateMsg{err: err}
 		}
-
-		selectedSerial := currentSerial // Start with the serial passed from the model
-		if deviceSerial != "" { // If DEVICE_SERIAL const is set, it overrides
-			selectedSerial = deviceSerial
-		}
-
-		if len(devices) == 0 {
-			return adbStatusMsg{
-				status: statusErrStyle.Render("Disconnected"),
-				info:   statusInfoStyle.Render("N/A"),
-				ready:  false,
-				logMsg: logErrorStyle.Render("No Android device detected. Connect phone & enable USB debugging."),
-			}
-		} else if len(devices) > 1 && selectedSerial == "" {
-			// Multiple devices found, and no specific serial configured or detected yet
-			return adbStatusMsg{
-				status: statusWarnStyle.Render("Multiple Devices"),
-				info:   statusInfoStyle.Render(fmt.Sprintf("Specify serial (found: %s)", strings.Join(devices, ", "))),
-				ready:  false,
-				logMsg: logWarnStyle.Render(fmt.Sprintf("Multiple devices found. Please set `deviceSerial` in the script, or specify the serial number: %s", strings.Join(devices, ", "))),
-			}
+		lines := strings.Split(out, "\n")
+		if len(lines) > 1 && strings.Contains(lines[1], "device") {
+			status.deviceConnected = true
+			model, _ := runCmd(status.adbPath, "shell", "getprop", "ro.product.model")
+			status.deviceName = model
 		} else {
-			// If selectedSerial is still empty, and only one device, auto-select it
-			if selectedSerial == "" && len(devices) == 1 {
-				selectedSerial = devices[0]
-			} else { // Verify specified serial is present
-				found := false
-				for _, d := range devices {
-					if d == selectedSerial {
-						found = true
+			status.deviceConnected = false
+			status.deviceName = "No device found"
+			return statusUpdateMsg{status: status}
+		}
+
+		status.currentUSBFunction, _ = runCmd(status.adbPath, "shell", "svc", "usb", "getFunctions")
+		status.isTethering = status.currentUSBFunction == tetherUSBFunction
+		status.tetherDunRequired, _ = runCmd(status.adbPath, "shell", "settings", "get", "global", "tether_dun_required")
+		status.tetherOffloadDisabled, _ = runCmd(status.adbPath, "shell", "settings", "get", "global", "tether_offload_disabled")
+
+		status.networkInterfaceName = "Not found"
+		status.networkIP = "N/A"
+		if status.isTethering {
+			interfaces, err := net.Interfaces()
+			if err == nil {
+				for _, i := range interfaces {
+					if strings.HasPrefix(i.Name, "usb") || strings.HasPrefix(i.Name, "rndis") {
+						addrs, err := i.Addrs()
+						if err == nil {
+							for _, addr := range addrs {
+								var ip net.IP
+								switch v := addr.(type) {
+								case *net.IPNet:
+									ip = v.IP
+								case *net.IPAddr:
+									ip = v.IP
+								}
+								if ip != nil && ip.To4() != nil {
+									status.networkInterfaceName = i.Name
+									status.networkIP = ip.String()
+									break
+								}
+							}
+						}
+					}
+					if status.networkIP != "N/A" {
 						break
 					}
 				}
-				if !found {
-					return adbStatusMsg{
-						status: statusErrStyle.Render("Specified Device Not Found"),
-						info:   statusInfoStyle.Render(selectedSerial),
-						ready:  false,
-						logMsg: logErrorStyle.Render(fmt.Sprintf("Specified device (%s) not found among connected devices.", selectedSerial)),
-					}
-				}
-			}
-
-			// Test authorization
-			testCmd := exec.Command(adbPath, "-s", selectedSerial, "shell", "echo", "test")
-			testOutput, testErr := testCmd.CombinedOutput()
-			if testErr != nil || strings.Contains(strings.ToLower(string(testOutput)), "unauthorized") {
-				return adbStatusMsg{
-					status: statusErrStyle.Render("Auth Failed"),
-					info:   statusInfoStyle.Render(selectedSerial),
-					ready:  false,
-					serial: selectedSerial, // Still return serial even if auth failed
-					logMsg: logErrorStyle.Render(fmt.Sprintf("Failed to communicate with %s. Ensure authorization (prompt on phone).", selectedSerial)),
-				}
-			}
-
-			return adbStatusMsg{
-				status: statusOKStyle.Render("Connected"),
-				info:   statusInfoStyle.Render(selectedSerial),
-				ready:  true,
-				serial: selectedSerial,
-				logMsg: logSuccessStyle.Render(fmt.Sprintf("ADB connection established with %s.", selectedSerial)),
 			}
 		}
+		return statusUpdateMsg{status: status}
 	}
 }
 
-func getLinuxInterfaceStatusCmd() tea.Cmd {
+func toggleTethering(enable bool) tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command("ip", "link", "show")
-		output, err := cmd.Output()
+		adbPath, err := exec.LookPath("adb")
 		if err != nil {
-			return linuxIfaceStatusMsg{
-				status: statusErrStyle.Render("ERROR: 'ip' missing"),
-				logMsg: logErrorStyle.Render(fmt.Sprintf("'ip' command not found or error: %v", err)),
-			}
+			return tetheringDoneMsg{err: err}
 		}
 
-		// Regex to find common RNDIS/USB tethering interface names with UP status
-		re := regexp.MustCompile(`\d+: (usb\d+|rndis\d+|enp\S+u\d+): <.*BROADCAST,MULTICAST,UP.*>`)
-		match := re.FindStringSubmatch(string(output))
-
-		if len(match) > 1 {
-			interfaceName := match[1]
-			ipCmd := exec.Command("ip", "-4", "addr", "show", "dev", interfaceName)
-			ipOutput, ipErr := ipCmd.Output()
-
-			if ipErr == nil {
-				ipRe := regexp.MustCompile(`inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
-				ipMatch := ipRe.FindStringSubmatch(string(ipOutput))
-				if len(ipMatch) > 1 {
-					return linuxIfaceStatusMsg{
-						status: statusOKStyle.Render(fmt.Sprintf("%s (IP: %s)", interfaceName, ipMatch[1])),
-						logMsg: logSuccessStyle.Render(fmt.Sprintf("Linux interface '%s' detected with IP: %s.", interfaceName, ipMatch[1])),
-					}
-				}
+		if enable {
+			log.Println("Enabling tethering...")
+			_, err = runCmd(adbPath, "shell", "settings", "put", "global", "tether_dun_required", "0")
+			if err != nil {
+				return tetheringDoneMsg{err: err}
 			}
-			return linuxIfaceStatusMsg{
-				status: statusWarnStyle.Render(fmt.Sprintf("%s (No IP)", interfaceName)),
-				logMsg: logWarnStyle.Render(fmt.Sprintf("Linux interface '%s' detected, but no IP. Needs DHCP config.", interfaceName)),
+			_, err = runCmd(adbPath, "shell", "svc", "usb", "setFunctions", tetherUSBFunction)
+			if err != nil {
+				return tetheringDoneMsg{err: err}
 			}
-		}
-		return linuxIfaceStatusMsg{
-			status: statusErrStyle.Render("Not Detected"),
-			logMsg: logErrorStyle.Render("No active USB-related network interface found on Linux."),
-		}
-	}
-}
-
-func runAdbCommandCmd(serial, description string, shellCommand string) tea.Cmd {
-	return func() tea.Msg {
-		if serial == "" {
-			return adbCommandResultMsg{description: description, success: false, output: "Error: Device serial is not available."}
-		}
-
-		// shellCommand can be "root" or "shell settings put global ..."
-		var cmd *exec.Cmd
-		if strings.HasPrefix(shellCommand, "shell ") {
-			// For "shell" commands, split "shell" from the rest
-			parts := strings.SplitN(shellCommand, " ", 2)
-			if len(parts) < 2 { // Should not happen if shellCommand is properly formed
-				return adbCommandResultMsg{description: description, success: false, output: fmt.Sprintf("Invalid shell command format: %s", shellCommand)}
+			time.Sleep(2 * time.Second)
+			_, err = runCmd(adbPath, "shell", "settings", "put", "global", "tether_offload_disabled", "1")
+			if err != nil {
+				return tetheringDoneMsg{err: err}
 			}
-			cmd = exec.Command(adbPath, "-s", serial, parts[0], parts[1])
 		} else {
-			// For non-shell commands like "root"
-			cmd = exec.Command(adbPath, "-s", serial, shellCommand)
+			log.Println("Disabling tethering...")
+			_, err = runCmd(adbPath, "shell", "svc", "usb", "setFunctions", defaultUSBFunction)
+			if err != nil {
+				return tetheringDoneMsg{err: err}
+			}
 		}
 
-		output, err := cmd.CombinedOutput() // Capture both stdout and stderr
-		success := err == nil
-
-		return adbCommandResultMsg{description: description, success: success, output: string(output)}
+		log.Println("Tethering action complete.")
+		return tetheringDoneMsg{err: nil}
 	}
 }
+
+// --- BUBBLE TEA IMPLEMENTATION ---
+
+func initialModel() model {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(colorPurple)
+
+	return model{
+		spinner:   s,
+		isLoading: true,
+		logs: []logEntry{
+			{timestamp: time.Now(), level: logLevelInfo, message: "Go Tether TUI Initializing..."},
+		},
+		menuChoices: []string{
+			"Enable Tethering",
+			"Disable Tethering",
+			"Refresh & Flush Log",
+			"Daemonize (placeholder)",
+			"Exit",
+		},
+		menuCursor: 0,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(
+		m.spinner.Tick,
+		addLog(logLevelInfo, "Checking for ADB..."),
+		checkStatus(),
+	)
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		leftPaneWidth := m.width/3 + 2
+		logViewWidth := m.width - leftPaneWidth - appStyle.GetHorizontalFrameSize() - 2
+		logViewHeight := m.height - appStyle.GetVerticalFrameSize() - 5
+		m.logView = viewport.New(logViewWidth, logViewHeight)
+		m.logView.Style = boxStyle
+		m.ready = true
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "up", "k":
+			if m.menuCursor > 0 {
+				m.menuCursor--
+			}
+		case "down", "j":
+			if m.menuCursor < len(m.menuChoices)-1 {
+				m.menuCursor++
+			}
+		case "enter":
+			switch m.menuCursor {
+			case 0: // Enable Tethering
+				if m.status.deviceConnected {
+					m.isLoading = true
+					m.lastLog = "Enabling tethering..."
+					cmds = append(cmds, addLog(logLevelCmd, m.lastLog), toggleTethering(true))
+				} else {
+					cmds = append(cmds, addLog(logLevelWarn, "Cannot enable: No device connected."))
+				}
+			case 1: // Disable Tethering
+				if m.status.deviceConnected {
+					m.isLoading = true
+					m.lastLog = "Disabling tethering..."
+					cmds = append(cmds, addLog(logLevelCmd, m.lastLog), toggleTethering(false))
+				} else {
+					cmds = append(cmds, addLog(logLevelWarn, "Cannot disable: No device connected."))
+				}
+			case 2: // Refresh & Flush
+				m.isLoading = true
+				m.lastLog = "Refreshing status..."
+				m.logs = []logEntry{} // Flush logs
+				cmds = append(cmds, addLog(logLevelCmd, "Log flushed and status refreshed."), checkStatus())
+			case 3: // Daemonize
+				// NOTE: True daemonization is complex. This is a placeholder.
+				cmds = append(cmds, addLog(logLevelWarn, "Daemonize feature is not yet implemented."))
+			case 4: // Exit
+				return m, tea.Quit
+			}
+		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
+
+	case logMsg:
+		m.logs = append(m.logs, logEntry(msg))
+
+	case statusUpdateMsg:
+		m.isLoading = false
+		m.lastLog = ""
+		if msg.err != nil {
+			m.error = msg.err
+			cmds = append(cmds, addLog(logLevelError, msg.err.Error()))
+		} else {
+			m.status = msg.status
+			cmds = append(cmds, addLog(logLevelInfo, "Status updated successfully."))
+		}
+
+	case tetheringDoneMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.error = msg.err
+			cmds = append(cmds, addLog(logLevelError, "Tethering command failed: "+msg.err.Error()))
+		} else {
+			m.error = nil
+			cmds = append(cmds, addLog(logLevelInfo, "Tethering action successful. Refreshing..."))
+		}
+		cmds = append(cmds, checkStatus())
+	}
+
+	if m.ready {
+		var logLines []string
+		for _, l := range m.logs {
+			levelColor := colorGray
+			switch l.level {
+			case logLevelInfo:
+				levelColor = colorGreen
+			case logLevelWarn:
+				levelColor = colorYellow
+			case logLevelError:
+				levelColor = colorRed
+			case logLevelCmd:
+				levelColor = colorPurple
+			}
+			ts := l.timestamp.Format("15:04:05")
+			logLines = append(logLines, fmt.Sprintf("%s [%s] %s", ts, lipgloss.NewStyle().Foreground(levelColor).Render(l.level), l.message))
+		}
+		m.logView.SetContent(strings.Join(logLines, "\n"))
+		m.logView.GotoBottom()
+	}
+
+	var cmd tea.Cmd
+	m.logView, cmd = m.logView.Update(msg)
+	cmds = append(cmds, cmd)
+
+	return m, tea.Batch(cmds...)
+}
+
+func (m model) View() string {
+	if !m.ready {
+		return "Initializing..."
+	}
+
+	// --- RENDER PANES ---
+	leftColumnWidth := m.width / 3
+	devicePane := m.renderDevicePane(leftColumnWidth)
+	menuPane := m.renderMenuPane(leftColumnWidth)
+
+	leftColumn := lipgloss.JoinVertical(lipgloss.Left,
+		devicePane,
+		menuPane,
+	)
+
+	rightColumn := lipgloss.JoinVertical(lipgloss.Left,
+		boxHeaderStyle.Render("EVENT LOG"),
+		m.logView.View(),
+	)
+
+	// --- RENDER FOOTER ---
+	loading := ""
+	if m.isLoading {
+		loading = fmt.Sprintf("%s %s", m.spinner.View(), m.lastLog)
+	}
+
+	mainContent := lipgloss.JoinVertical(lipgloss.Left,
+		m.renderBanner(),
+		lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, rightColumn),
+		loading,
+	)
+
+	return appStyle.Render(mainContent)
+}
+
+func (m model) renderBanner() string {
+    // Generate figlet text
+    figletText := generateFigletText()
+
+    // Create a style for the figlet text
+    figletStyle := lipgloss.NewStyle().
+        Bold(true).
+        Foreground(lipgloss.Color("#FAFAFA")).
+        Background(colorPurple).
+        Padding(0, 1)
+
+    // Join the figlet text with spaces to fit the width
+    joinedFigletText := strings.Join(figletText, " ")
+
+    return figletStyle.Render(joinedFigletText)
+}
+
+// New function to generate figlet text
+func generateFigletText() []string {
+    // Replace this with actual figlet generation logic
+    return []string{"Tar'd 'N Tethered"}
+}
+func (m model) renderDevicePane(width int) string {
+	statusText := statusErrStyle.Render("Disconnected")
+	if m.status.deviceConnected {
+		statusText = statusOKStyle.Render("Connected")
+	}
+	stateText := statusMidStyle.Render("Disabled")
+	if m.status.isTethering {
+		stateText = statusOKStyle.Render("Enabled")
+	}
+	ipText := statusMidStyle.Render(m.status.networkInterfaceName)
+	if m.status.networkIP != "N/A" {
+		ipText = statusOKStyle.Render(m.status.networkIP)
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("Status:"), statusText),
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("Device:"), m.status.deviceName),
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("State:"), stateText),
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("USB Mode:"), m.status.currentUSBFunction),
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("Interface:"), m.status.networkInterfaceName),
+		fmt.Sprintf("%s %s", statusKeyStyle.Render("IP Address:"), ipText),
+	)
+	
+	return boxStyle.Width(width).Render(
+		lipgloss.JoinVertical(lipgloss.Left, 
+			boxHeaderStyle.Render("CURRENT STATUS:"), 
+			content,
+		),
+	)
+}
+
+
+func (m model) renderMenuPane(width int) string {
+	var b strings.Builder
+	for i, choice := range m.menuChoices {
+		var item string
+		if m.menuCursor == i {
+			item = menuCursorStyle.Render("> " + choice)
+		} else {
+			item = menuItemStyle.Render("  " + choice)
+		}
+		b.WriteString(item + "\n")
+	}
+
+	return menuStyle.Width(width).Render(
+		lipgloss.JoinVertical(lipgloss.Left, boxHeaderStyle.Render("COMMANDS"), b.String()),
+	)
+}
+
+// --- MAIN FUNCTION ---
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen()) // WithAltScreen makes it full-screen
+	f, err := os.OpenFile("go-tether.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	defer f.Close()
+	log.SetOutput(f)
+	log.Println("Application starting...")
+
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v\n", err)
+		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)
 	}
 }
